@@ -38,13 +38,24 @@ $user_id = $_SESSION['user_id'];
         <?php if (isset($_GET['success'])): ?>
             <div class="alert alert-success"><?php echo htmlspecialchars($_GET['success']); ?></div>
         <?php endif; ?>
+        <?php if (isset($_GET['processing'])): ?>
+            <div class="alert alert-info shadow-sm rounded-4">
+                <div class="d-flex align-items-center">
+                    <div class="spinner-border spinner-border-sm text-info me-3" role="status"></div>
+                    <div>
+                        <strong>Pembayaran sedang diproses!</strong>
+                        <br><small>Kami sedang mengonfirmasi pembayaran Anda. Jika pesanan belum muncul, silakan muat ulang halaman ini dalam beberapa saat.</small>
+                    </div>
+                </div>
+            </div>
+        <?php endif; ?>
 
         <div class="row">
             <?php
             $stmt = $conn->prepare("SELECT r.*, k.nama_kamar, k.harga_per_bulan, k.foto_utama 
                                     FROM reservasi r 
                                     JOIN kamar k ON r.id_kamar = k.id_kamar 
-                                    WHERE r.id_pengguna = ? 
+                                    WHERE r.id_pengguna = ? AND r.status_reservasi != 'Menunggu Pembayaran'
                                     ORDER BY r.dibuat_pada DESC");
             $stmt->bind_param("i", $user_id);
             $stmt->execute();
