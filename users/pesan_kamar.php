@@ -153,6 +153,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $payload = [
                 'transaction_details' => $transaction_details,
                 'customer_details' => $customer_details,
+                'custom_expiry' => [
+                    'order_time' => date('Y-m-d H:i:s O'),
+                    'expiry_duration' => 24,
+                    'unit' => 'hour'
+                ]
             ];
 
             $url = $isProduction ? 'https://app.midtrans.com/snap/v1/transactions' : 'https://app.sandbox.midtrans.com/snap/v1/transactions';
@@ -168,13 +173,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             ]);
 
             $response = curl_exec($ch);
-            curl_close($ch);
 
             $snapToken = '';
+            $redirectUrl = '';
             if ($response) {
                 $responseObj = json_decode($response);
                 if (isset($responseObj->token)) {
                     $snapToken = $responseObj->token;
+                    $redirectUrl = $responseObj->redirect_url ?? '';
+
+                    // Masukkan ke tabel pembayaran
+                    $kode_pesanan = $transaction_details['order_id'];
+                    $p_stmt = $conn->prepare("INSERT INTO pembayaran (id_reservasi, kode_pesanan, jumlah_bayar, status_transaksi, token_snap, url_pembayaran) VALUES (?, ?, ?, 'menunggu', ?, ?)");
+                    $p_stmt->bind_param("isdss", $insert_id, $kode_pesanan, $price, $snapToken, $redirectUrl);
+                    $p_stmt->execute();
+
                 } else {
                     $message = "<div class='alert alert-danger'>Gagal mendapatkan token pembayaran dari Midtrans. " . htmlspecialchars($response) . "</div>";
                 }

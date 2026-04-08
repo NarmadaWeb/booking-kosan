@@ -32,6 +32,15 @@ if (count($parts) < 2) {
 }
 
 $id_reservasi = (int)$parts[1];
+$payment_type = $result['payment_type'] ?? '';
+$fraud_status = $result['fraud_status'] ?? '';
+
+// Update Pembayaran Table
+$p_stmt = $conn->prepare("UPDATE pembayaran SET status_transaksi = ?, jenis_pembayaran = ?, status_penipuan = ?, pesan_status = ?, dibayar_pada = CURRENT_TIMESTAMP WHERE id_reservasi = ? AND kode_pesanan = ?");
+$pesan_status = json_encode($result);
+$p_stmt->bind_param("ssssis", $transaction_status, $payment_type, $fraud_status, $pesan_status, $id_reservasi, $order_id);
+$p_stmt->execute();
+
 
 if ($transaction_status == 'capture' || $transaction_status == 'settlement') {
     // Pembayaran Sukses
@@ -41,6 +50,11 @@ if ($transaction_status == 'capture' || $transaction_status == 'settlement') {
 } else if ($transaction_status == 'cancel' || $transaction_status == 'deny' || $transaction_status == 'expire') {
     // Pembayaran Gagal/Expired
     $stmt = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Dibatalkan' WHERE id_reservasi = ?");
+    $stmt->bind_param("i", $id_reservasi);
+    $stmt->execute();
+} else if ($transaction_status == 'pending') {
+    // Menunggu Pembayaran (Optional tapi untuk memastikan state)
+    $stmt = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Menunggu Pembayaran' WHERE id_reservasi = ?");
     $stmt->bind_param("i", $id_reservasi);
     $stmt->execute();
 }
