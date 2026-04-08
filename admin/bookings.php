@@ -10,6 +10,7 @@ $success_msg = '';
 if (isset($_GET['msg'])) {
     if ($_GET['msg'] == 'updated') $success_msg = "Status reservasi berhasil diperbarui.";
     if ($_GET['msg'] == 'deleted') $success_msg = "Data reservasi berhasil dihapus.";
+    if ($_GET['msg'] == 'offline_added') $success_msg = "Pemesanan offline berhasil ditambahkan.";
 }
 
 // Handle Delete
@@ -75,6 +76,9 @@ if (isset($_GET['action']) && $_GET['action'] === 'delete' && isset($_GET['id'])
                 <h4 class="fw-bold mb-1"><i class="fas fa-receipt me-2"></i>Kelola Reservasi</h4>
                 <p class="opacity-75 mb-0 small">Pantau status pemesanan kamar kost</p>
             </div>
+            <a href="add_booking_offline.php" class="btn btn-light rounded-pill fw-bold text-primary px-4">
+                <i class="fas fa-plus me-2"></i>Tambah Pemesanan Offline
+            </a>
         </div>
 
         <?php if ($success_msg): ?>

@@ -52,9 +52,10 @@ $user_id = $_SESSION['user_id'];
 
         <div class="row">
             <?php
-            $stmt = $conn->prepare("SELECT r.*, k.nama_kamar, k.harga_per_bulan, k.foto_utama 
+            $stmt = $conn->prepare("SELECT r.*, k.nama_kamar, k.harga_per_bulan, k.foto_utama, p.status_transaksi
                                     FROM reservasi r 
                                     JOIN kamar k ON r.id_kamar = k.id_kamar 
+                                    LEFT JOIN pembayaran p ON r.id_reservasi = p.id_reservasi
                                     WHERE r.id_pengguna = ? AND r.status_reservasi != 'Menunggu Pembayaran'
                                     ORDER BY r.dibuat_pada DESC");
             $stmt->bind_param("i", $user_id);
@@ -74,7 +75,7 @@ $user_id = $_SESSION['user_id'];
                             <div class="col-md-7">
                                 <h5 class="card-title"><?php echo htmlspecialchars($row['nama_kamar']); ?></h5>
                                 <p class="mb-1 text-muted"><i class="fas fa-calendar"></i> <?php echo $row['tanggal_masuk']; ?> sampai <?php echo $row['tanggal_keluar']; ?></p>
-                                <p class="mb-0"><strong>Status:</strong> 
+                                <p class="mb-1"><strong>Status Konfirmasi:</strong>
                                     <?php 
                                     $badge = 'bg-secondary';
                                     $status_text = $row['status_reservasi'] ?? '-';
@@ -87,13 +88,32 @@ $user_id = $_SESSION['user_id'];
                                         $status_text = 'Dibatalkan';
                                     } elseif ($row['status_reservasi'] == 'Menunggu') {
                                         $badge = 'bg-warning text-dark';
-                                        $status_text = 'Menunggu Konfirmasi';
+                                        $status_text = 'Menunggu Konfirmasi Admin';
                                     } elseif ($row['status_reservasi'] == 'Selesai') {
                                         $badge = 'bg-info text-dark';
                                         $status_text = 'Selesai';
                                     }
                                     ?>
                                     <span class="badge <?php echo $badge; ?>"><?php echo $status_text; ?></span>
+                                </p>
+                                <p class="mb-0"><strong>Status Pembayaran:</strong>
+                                    <?php
+                                    $pay_badge = 'bg-secondary';
+                                    $pay_status_text = 'Belum Lunas';
+                                    $pt = strtolower($row['status_transaksi'] ?? '');
+
+                                    if ($pt == 'settlement' || $pt == 'capture' || $pt == 'lunas') {
+                                        $pay_badge = 'bg-success';
+                                        $pay_status_text = 'Lunas';
+                                    } elseif ($pt == 'pending' || $pt == 'menunggu') {
+                                        $pay_badge = 'bg-warning text-dark';
+                                        $pay_status_text = 'Menunggu Pembayaran';
+                                    } elseif ($pt == 'cancel' || $pt == 'deny' || $pt == 'expire') {
+                                        $pay_badge = 'bg-danger';
+                                        $pay_status_text = 'Gagal / Expired';
+                                    }
+                                    ?>
+                                    <span class="badge <?php echo $pay_badge; ?>"><?php echo $pay_status_text; ?></span>
                                 </p>
                                 <div class="mt-3">
                                     <?php if ($row['status_reservasi'] == 'Dikonfirmasi'): ?>
