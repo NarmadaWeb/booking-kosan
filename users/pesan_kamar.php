@@ -129,12 +129,86 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     } elseif ($check_in >= $check_out) {
         $message = "<div class='alert alert-danger'>Tanggal keluar harus setelah tanggal masuk.</div>";
     } else {
-        $stmt = $conn->prepare("INSERT INTO reservasi (id_kamar, id_pengguna, nama_pemesan, email_pemesan, no_hp_pemesan, tanggal_masuk, tanggal_keluar, durasi_sewa, jumlah_tamu, total_harga, status_reservasi, metode_pembayaran, bukti_pembayaran, catatan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Menunggu', ?, ?, ?)");
+        $stmt = $conn->prepare("INSERT INTO reservasi (id_kamar, id_pengguna, nama_pemesan, email_pemesan, no_hp_pemesan, tanggal_masuk, tanggal_keluar, durasi_sewa, jumlah_tamu, total_harga, status_reservasi, metode_pembayaran, bukti_pembayaran, catatan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Menunggu Pembayaran', ?, ?, ?)");
         $stmt->bind_param("iissssssidsss", $room_id, $user_id, $full_name, $email_pemesan, $no_hp_pemesan, $check_in, $check_out, $durasi_label, $guests, $price, $payment_method, $payment_proof, $catatan);
 
         if ($stmt->execute()) {
-            echo "<script>alert('Pesanan berhasil! Harap tunggu konfirmasi admin.'); window.location.href='pesanan_saya.php';</script>";
-            exit();
+            $insert_id = $stmt->insert_id;
+
+            // Generate Midtrans Snap Token
+            $serverKey = MIDTRANS_SERVER_KEY;
+            $isProduction = MIDTRANS_IS_PRODUCTION;
+
+            $transaction_details = [
+                'order_id' => 'BERKAH-' . $insert_id . '-' . time(),
+                'gross_amount' => $price,
+            ];
+
+            $customer_details = [
+                'first_name' => $full_name,
+                'email' => $email_pemesan,
+                'phone' => $no_hp_pemesan,
+            ];
+
+            $payload = [
+                'transaction_details' => $transaction_details,
+                'customer_details' => $customer_details,
+            ];
+
+            $url = $isProduction ? 'https://app.midtrans.com/snap/v1/transactions' : 'https://app.sandbox.midtrans.com/snap/v1/transactions';
+
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+            curl_setopt($ch, CURLOPT_HTTPHEADER, [
+                'Content-Type: application/json',
+                'Accept: application/json',
+                'Authorization: Basic ' . base64_encode($serverKey . ':')
+            ]);
+
+            $response = curl_exec($ch);
+            curl_close($ch);
+
+            $snapToken = '';
+            if ($response) {
+                $responseObj = json_decode($response);
+                if (isset($responseObj->token)) {
+                    $snapToken = $responseObj->token;
+                } else {
+                    $message = "<div class='alert alert-danger'>Gagal mendapatkan token pembayaran dari Midtrans. " . htmlspecialchars($response) . "</div>";
+                }
+            } else {
+                 $message = "<div class='alert alert-danger'>Gagal terhubung ke Midtrans.</div>";
+            }
+
+            if ($snapToken) {
+                 $clientKey = MIDTRANS_CLIENT_KEY;
+                 $snapJsUrl = $isProduction ? 'https://app.midtrans.com/snap/snap.js' : 'https://app.sandbox.midtrans.com/snap/snap.js';
+                 echo "<!DOCTYPE html><html lang='id'><head><title>Memproses Pembayaran</title></head><body>";
+                 echo "<script src='{$snapJsUrl}' data-client-key='{$clientKey}'></script>";
+                 echo "<script>
+                     window.onload = function() {
+                         window.snap.pay('{$snapToken}', {
+                             onSuccess: function(result) {
+                                 window.location.href = 'pesanan_saya.php?processing=1';
+                             },
+                             onPending: function(result) {
+                                 window.location.href = 'pesanan_saya.php?processing=1';
+                             },
+                             onError: function(result) {
+                                 alert('Pembayaran gagal!');
+                                 window.location.href = 'pesanan_saya.php';
+                             },
+                             onClose: function() {
+                                 alert('Anda menutup popup tanpa menyelesaikan pembayaran');
+                                 window.location.href = 'pesanan_saya.php';
+                             }
+                         });
+                     };
+                 </script></body></html>";
+                 exit();
+            }
         } else {
             $message = "<div class='alert alert-danger'>Error: " . $conn->error . "</div>";
         }
@@ -296,7 +370,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                     </div>
 
                     <button type="submit" class="btn btn-primary btn-lg w-100 rounded-pill py-3 mt-3 shadow-lg fw-bold">
-                        <i class="fas fa-check-circle me-2"></i> KONFIRMASI PESANAN
+                        <i class="fas fa-check-circle me-2"></i> PEMBAYARAN
                     </button>
                 </div>
             </div>
