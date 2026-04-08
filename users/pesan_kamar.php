@@ -66,11 +66,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     $check_in       = $_POST['check_in'];
     $check_out      = $_POST['check_out'];
     $guests         = $_POST['guests'] ?? 1;
-    $payment_method = $_POST['payment_method'];
     $duration_type  = $_POST['duration_type'];
     $catatan        = $_POST['catatan'] ?? '';
-    $payment_proof  = null;
     $total_price    = $_POST['total_price'] ?? 0;
+    $payment_method = 'Midtrans';
 
     // Recalculate Logic
     $date1 = new DateTime($check_in);
@@ -103,34 +102,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         $durasi_label = $years . ' Tahun';
     }
 
-    // Handle File Upload
-    $upload_error = '';
-    if ($payment_method != 'Tunai') {
-        $file_input_name = ($payment_method == 'Transfer') ? 'payment_proof_transfer' : 'payment_proof_ewallet';
-
-        if (!empty($_FILES[$file_input_name]['name'])) {
-            $target_dir = "../public/uploads/proofs/";
-            if (!file_exists($target_dir)) mkdir($target_dir, 0777, true);
-
-            $file_extension = strtolower(pathinfo($_FILES[$file_input_name]["name"], PATHINFO_EXTENSION));
-            $new_filename   = uniqid('proof_') . '.' . $file_extension;
-            $target_file    = $target_dir . $new_filename;
-
-            if (move_uploaded_file($_FILES[$file_input_name]["tmp_name"], $target_file)) {
-                $payment_proof = "uploads/proofs/" . $new_filename;
-            } else {
-                $upload_error = "Gagal mengupload bukti pembayaran.";
-            }
-        }
-    }
-
-    if ($upload_error) {
-        $message = "<div class='alert alert-danger'>$upload_error</div>";
-    } elseif ($check_in >= $check_out) {
+    if ($check_in >= $check_out) {
         $message = "<div class='alert alert-danger'>Tanggal keluar harus setelah tanggal masuk.</div>";
     } else {
-        $stmt = $conn->prepare("INSERT INTO reservasi (id_kamar, id_pengguna, nama_pemesan, email_pemesan, no_hp_pemesan, tanggal_masuk, tanggal_keluar, durasi_sewa, jumlah_tamu, total_harga, status_reservasi, metode_pembayaran, bukti_pembayaran, catatan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Menunggu Pembayaran', ?, ?, ?)");
-        $stmt->bind_param("iissssssidsss", $room_id, $user_id, $full_name, $email_pemesan, $no_hp_pemesan, $check_in, $check_out, $durasi_label, $guests, $price, $payment_method, $payment_proof, $catatan);
+        $stmt = $conn->prepare("INSERT INTO reservasi (id_kamar, id_pengguna, nama_pemesan, email_pemesan, no_hp_pemesan, tanggal_masuk, tanggal_keluar, durasi_sewa, jumlah_tamu, total_harga, status_reservasi, metode_pembayaran, catatan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Menunggu Pembayaran', ?, ?)");
+        $stmt->bind_param("iissssssisss", $room_id, $user_id, $full_name, $email_pemesan, $no_hp_pemesan, $check_in, $check_out, $durasi_label, $guests, $price, $payment_method, $catatan);
 
         if ($stmt->execute()) {
             $insert_id = $stmt->insert_id;
@@ -153,11 +129,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $payload = [
                 'transaction_details' => $transaction_details,
                 'customer_details' => $customer_details,
-                'custom_expiry' => [
-                    'order_time' => date('Y-m-d H:i:s O'),
-                    'expiry_duration' => 24,
-                    'unit' => 'hour'
-                ]
             ];
 
             $url = $isProduction ? 'https://app.midtrans.com/snap/v1/transactions' : 'https://app.sandbox.midtrans.com/snap/v1/transactions';
@@ -175,19 +146,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             $response = curl_exec($ch);
 
             $snapToken = '';
-            $redirectUrl = '';
             if ($response) {
                 $responseObj = json_decode($response);
                 if (isset($responseObj->token)) {
                     $snapToken = $responseObj->token;
-                    $redirectUrl = $responseObj->redirect_url ?? '';
-
-                    // Masukkan ke tabel pembayaran
-                    $kode_pesanan = $transaction_details['order_id'];
-                    $p_stmt = $conn->prepare("INSERT INTO pembayaran (id_reservasi, kode_pesanan, jumlah_bayar, status_transaksi, token_snap, url_pembayaran) VALUES (?, ?, ?, 'menunggu', ?, ?)");
-                    $p_stmt->bind_param("isdss", $insert_id, $kode_pesanan, $price, $snapToken, $redirectUrl);
-                    $p_stmt->execute();
-
                 } else {
                     $message = "<div class='alert alert-danger'>Gagal mendapatkan token pembayaran dari Midtrans. " . htmlspecialchars($response) . "</div>";
                 }
@@ -196,18 +158,84 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
             }
 
             if ($snapToken) {
+                 // Insert record ke tabel pembayaran
+                 $order_id_val = $transaction_details['order_id'];
+                 $p_stmt = $conn->prepare("INSERT INTO pembayaran (id_reservasi, kode_pesanan, jumlah_bayar, status_transaksi, token_snap) VALUES (?, ?, ?, 'pending', ?)");
+                 $p_stmt->bind_param("isds", $insert_id, $order_id_val, $price, $snapToken);
+                 $p_stmt->execute();
+
                  $clientKey = MIDTRANS_CLIENT_KEY;
                  $snapJsUrl = $isProduction ? 'https://app.midtrans.com/snap/snap.js' : 'https://app.sandbox.midtrans.com/snap/snap.js';
-                 echo "<!DOCTYPE html><html lang='id'><head><title>Memproses Pembayaran</title></head><body>";
+                 $formatted_price = number_format($price, 0, ',', '.');
+                 $room_name_safe = htmlspecialchars($room['nama_kamar']);
+                 echo "<!DOCTYPE html><html lang='id'><head>
+                 <meta charset='UTF-8'>
+                 <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+                 <title>Pembayaran - Kos Berkah Malika</title>
+                 <link href='https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap' rel='stylesheet'>
+                 <link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css'>
+                 <style>
+                     * { margin: 0; padding: 0; box-sizing: border-box; }
+                     body { font-family: 'Poppins', sans-serif; min-height: 100vh; background: linear-gradient(135deg, #1e1b4b 0%, #312e81 30%, #4338ca 60%, #6366f1 100%); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+                     .bg-pattern { position: fixed; top: 0; left: 0; width: 100%; height: 100%; opacity: 0.05; background-image: radial-gradient(circle at 25% 25%, white 2px, transparent 2px), radial-gradient(circle at 75% 75%, white 1px, transparent 1px); background-size: 60px 60px, 40px 40px; pointer-events: none; }
+                     .glow-1 { position: fixed; top: -150px; right: -150px; width: 400px; height: 400px; background: radial-gradient(circle, rgba(139,92,246,0.3), transparent 70%); border-radius: 50%; animation: float 6s ease-in-out infinite; }
+                     .glow-2 { position: fixed; bottom: -100px; left: -100px; width: 350px; height: 350px; background: radial-gradient(circle, rgba(99,102,241,0.25), transparent 70%); border-radius: 50%; animation: float 8s ease-in-out infinite reverse; }
+                     @keyframes float { 0%, 100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-30px) scale(1.05); } }
+                     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+                     @keyframes spin { to { transform: rotate(360deg); } }
+                     @keyframes fadeInUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
+                     .payment-card { background: rgba(255,255,255,0.08); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.15); border-radius: 28px; padding: 3rem 2.5rem; max-width: 460px; width: 90%; text-align: center; color: white; animation: fadeInUp 0.6s ease-out; box-shadow: 0 25px 60px rgba(0,0,0,0.3); }
+                     .brand-logo { font-size: 1.1rem; font-weight: 700; letter-spacing: 1px; margin-bottom: 2rem; opacity: 0.9; }
+                     .brand-logo i { color: #a5b4fc; margin-right: 8px; }
+                     .spinner-ring { width: 64px; height: 64px; border: 3px solid rgba(255,255,255,0.15); border-top-color: #a5b4fc; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 1.5rem; }
+                     .payment-title { font-size: 1.3rem; font-weight: 700; margin-bottom: 0.4rem; }
+                     .payment-subtitle { font-size: 0.85rem; opacity: 0.6; margin-bottom: 2rem; }
+                     .info-divider { width: 50px; height: 3px; background: linear-gradient(90deg, #818cf8, #a5b4fc); border-radius: 10px; margin: 0 auto 1.5rem; }
+                     .room-info { background: rgba(255,255,255,0.06); border-radius: 16px; padding: 1.2rem; margin-bottom: 1.5rem; border: 1px solid rgba(255,255,255,0.08); }
+                     .room-name { font-weight: 600; font-size: 1rem; margin-bottom: 0.3rem; }
+                     .room-detail { font-size: 0.78rem; opacity: 0.5; }
+                     .room-detail i { margin-right: 5px; color: #a5b4fc; }
+                     .price-tag { font-size: 2rem; font-weight: 800; background: linear-gradient(135deg, #c7d2fe, #e0e7ff); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; margin-bottom: 0.3rem; }
+                     .price-label { font-size: 0.75rem; opacity: 0.5; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 1.5rem; }
+                     .secure-badge { display: inline-flex; align-items: center; gap: 6px; background: rgba(34,197,94,0.15); color: #86efac; padding: 0.4rem 1rem; border-radius: 50px; font-size: 0.72rem; font-weight: 600; }
+                     .secure-badge i { font-size: 0.7rem; }
+                 </style></head><body>
+                 <div class='bg-pattern'></div>
+                 <div class='glow-1'></div>
+                 <div class='glow-2'></div>
+                 <div class='payment-card'>
+                     <div class='brand-logo'><i class='fas fa-home'></i>KOS BERKAH MALIKA</div>
+                     <div class='spinner-ring'></div>
+                     <div class='payment-title'>Memproses Pembayaran</div>
+                     <div class='payment-subtitle'>Popup pembayaran akan segera muncul...</div>
+                     <div class='info-divider'></div>
+                     <div class='room-info'>
+                         <div class='room-name'><i class='fas fa-door-open me-2' style='color:#a5b4fc'></i>{$room_name_safe}</div>
+                         <div class='room-detail'><i class='fas fa-calendar-check'></i>Durasi: {$durasi_label}</div>
+                     </div>
+                     <div class='price-tag'>Rp {$formatted_price}</div>
+                     <div class='price-label'>Total Pembayaran</div>
+                     <div class='secure-badge'><i class='fas fa-lock'></i> Transaksi Aman via Midtrans</div>
+                 </div>";
                  echo "<script src='{$snapJsUrl}' data-client-key='{$clientKey}'></script>";
                  echo "<script>
+                     function verifyAndRedirect(reservasiId) {
+                         fetch('verify_payment.php?id=' + reservasiId)
+                             .then(function(r) { return r.json(); })
+                             .then(function() {
+                                 window.location.href = 'pesanan_saya.php';
+                             })
+                             .catch(function() {
+                                 window.location.href = 'pesanan_saya.php';
+                             });
+                     }
                      window.onload = function() {
                          window.snap.pay('{$snapToken}', {
                              onSuccess: function(result) {
-                                 window.location.href = 'pesanan_saya.php?processing=1';
+                                 verifyAndRedirect({$insert_id});
                              },
                              onPending: function(result) {
-                                 window.location.href = 'pesanan_saya.php?processing=1';
+                                 verifyAndRedirect({$insert_id});
                              },
                              onError: function(result) {
                                  alert('Pembayaran gagal!');
@@ -250,10 +278,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
         .segment-input { display: none; }
         .segment-label { display: block; text-align: center; padding: 10px; border-radius: 10px; cursor: pointer; font-weight: 600; font-size: 0.85rem; color: #64748b; transition: 0.2s; }
         .segment-input:checked + .segment-label { background: white; color: #4f46e5; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
-        .payment-option { border: 2px solid #f1f5f9; border-radius: 16px; padding: 1.2rem; cursor: pointer; transition: 0.3s; text-align: center; height: 100%; background: white; }
-        .payment-input { display: none; }
-        .payment-input:checked + .payment-option { border-color: #4f46e5; background-color: #f5f3ff; }
-        .payment-input:checked + .payment-option i { color: #4f46e5 !important; }
+
         .total-price-display { font-size: 2rem; font-weight: 800; color: #4f46e5; }
         .room-summary-img { width: 100%; height: 180px; object-fit: cover; border-radius: 16px; }
     </style>
@@ -268,7 +293,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     </div>
 
     <div class="container py-5">
-        <form method="POST" enctype="multipart/form-data">
+        <form method="POST">
         <div class="row g-4">
             
             <div class="col-lg-8">
@@ -338,52 +363,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
                         <div class="badge bg-indigo-600 rounded-pill px-3 py-2" id="durationText">Pilih tanggal untuk cek biaya</div>
                     </div>
 
-                    <h5 class="fw-bold mb-4 d-flex align-items-center"><i class="fas fa-wallet me-3 text-indigo-600"></i>Metode Pembayaran</h5>
-                    
-                    <div class="row g-3 mb-4">
-                        <div class="col-md-4">
-                            <input type="radio" name="payment_method" id="pmCash" value="Tunai" checked class="payment-input" onchange="togglePayment()">
-                            <label for="pmCash" class="payment-option">
-                                <i class="fas fa-money-bill-wave fa-2x mb-2 text-muted"></i>
-                                <div class="fw-bold small">Tunai / COD</div>
-                            </label>
-                        </div>
-                        <div class="col-md-4">
-                            <input type="radio" name="payment_method" id="pmTransfer" value="Transfer" class="payment-input" onchange="togglePayment()">
-                            <label for="pmTransfer" class="payment-option">
-                                <i class="fas fa-university fa-2x mb-2 text-muted"></i>
-                                <div class="fw-bold small">Transfer Bank</div>
-                            </label>
-                        </div>
-                        <div class="col-md-4">
-                            <input type="radio" name="payment_method" id="pmEwallet" value="E-Wallet" class="payment-input" onchange="togglePayment()">
-                            <label for="pmEwallet" class="payment-option">
-                                <i class="fas fa-qrcode fa-2x mb-2 text-muted"></i>
-                                <div class="fw-bold small">QRIS / E-Money</div>
-                            </label>
-                        </div>
-                    </div>
-
-                    <div id="transferInfo" class="alert alert-light border rounded-4" style="display:none;">
-                        <h6 class="fw-bold mb-2 small uppercase">Rekening Pembayaran</h6>
-                        <div class="d-flex justify-content-between mb-1"><span>BCA</span> <strong>123-456-789</strong></div>
-                        <div class="d-flex justify-content-between mb-3"><span>A.N</span> <strong>Berkah Malika</strong></div>
-                        <label class="form-label small">Upload Bukti Transfer</label>
-                        <input type="file" name="payment_proof_transfer" class="form-control form-control-sm">
-                    </div>
-
-                    <div id="ewalletInfo" class="alert alert-light border rounded-4 text-center" style="display:none;">
-                        <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=MAJU-BERSAMA" class="mb-3 rounded shadow-sm border p-2 bg-white">
-                        <p class="small text-muted mb-3">Scan QRIS di atas dan sertakan bukti screenshot.</p>
-                        <input type="file" name="payment_proof_ewallet" class="form-control form-control-sm">
+                    <div class="bg-light p-4 rounded-4 mb-4 text-center border">
+                        <i class="fas fa-shield-alt fa-2x text-success mb-2"></i>
+                        <h6 class="fw-bold mb-1">Pembayaran via Midtrans</h6>
+                        <p class="small text-muted mb-0">Setelah menekan tombol di bawah, Anda akan diarahkan ke halaman pembayaran Midtrans. Tersedia berbagai metode: Transfer Bank, E-Wallet (GoPay, OVO, Dana), QRIS, dan lainnya.</p>
                     </div>
                     
-                    <div class="alert alert-warning small rounded-3 mt-4">
+                    <div class="alert alert-warning small rounded-3">
                          <i class="fas fa-info-circle me-2"></i> Dengan menekan tombol di bawah, Anda menyetujui syarat & ketentuan sewa Kos Berkah Malika.
                     </div>
 
                     <button type="submit" class="btn btn-primary btn-lg w-100 rounded-pill py-3 mt-3 shadow-lg fw-bold">
-                        <i class="fas fa-check-circle me-2"></i> PEMBAYARAN
+                        <i class="fas fa-credit-card me-2"></i> LANJUT KE PEMBAYARAN
                     </button>
                 </div>
             </div>
@@ -413,11 +404,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST') {
     <script>
         const prices = { Monthly: <?php echo $room['harga_per_bulan']; ?>, Yearly: <?php echo $room['harga_per_tahun']; ?> };
 
-        function togglePayment() {
-            const method = document.querySelector('input[name="payment_method"]:checked').value;
-            document.getElementById('transferInfo').style.display = (method === 'Transfer') ? 'block' : 'none';
-            document.getElementById('ewalletInfo').style.display = (method === 'E-Wallet') ? 'block' : 'none';
-        }
+
 
         function calculateTotal() {
             const checkIn  = document.getElementById('checkIn').value;

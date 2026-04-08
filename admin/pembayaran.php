@@ -6,7 +6,14 @@ if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'admin') {
 }
 require_once '../config/database.php';
 
-// Handle delete
+$success_msg = '';
+if (isset($_GET['msg'])) {
+    if ($_GET['msg'] == 'updated') $success_msg = "Status reservasi berhasil diperbarui.";
+    if ($_GET['msg'] == 'deleted') $success_msg = "Data reservasi berhasil dihapus.";
+    if ($_GET['msg'] == 'offline_added') $success_msg = "Pemesanan offline berhasil ditambahkan.";
+}
+
+// Handle Delete
 if (isset($_GET['action']) && $_GET['action'] === 'delete' && isset($_GET['id'])) {
     $id = (int)$_GET['id'];
     $conn->query("DELETE FROM pembayaran WHERE id_pembayaran = $id");
@@ -21,14 +28,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_status'])) {
     $stmt   = $conn->prepare("UPDATE pembayaran SET status_transaksi = ? WHERE id_pembayaran = ?");
     $stmt->bind_param("si", $status, $id);
     $stmt->execute();
+    
+    // Jika diubah ke lunas/settlement, update juga status reservasi
+    if ($status == 'lunas' || $status == 'settlement') {
+        $conn->query("UPDATE reservasi SET status_reservasi = 'Menunggu' WHERE id_reservasi = (SELECT id_reservasi FROM pembayaran WHERE id_pembayaran = $id)");
+    }
+    
     header("Location: pembayaran.php?updated=1");
     exit();
 }
 
-// Stats
-$total_lunas    = $conn->query("SELECT COUNT(*) as c FROM pembayaran WHERE status_transaksi = 'lunas'")->fetch_assoc()['c'];
-$total_menunggu = $conn->query("SELECT COUNT(*) as c FROM pembayaran WHERE status_transaksi = 'menunggu'")->fetch_assoc()['c'];
-$total_pendapatan = $conn->query("SELECT SUM(jumlah_bayar) as total FROM pembayaran WHERE status_transaksi = 'lunas'")->fetch_assoc()['total'] ?? 0;
+// Auto-verify: cek semua pembayaran yang masih pending ke Midtrans API
+$pending_payments = $conn->query("SELECT p.id_pembayaran, p.kode_pesanan, p.id_reservasi FROM pembayaran p JOIN reservasi r ON p.id_reservasi = r.id_reservasi WHERE p.status_transaksi = 'pending' ORDER BY p.id_pembayaran DESC LIMIT 20");
+
+$serverKey = MIDTRANS_SERVER_KEY;
+$isProduction = MIDTRANS_IS_PRODUCTION;
+
+if ($pending_payments && $pending_payments->num_rows > 0) {
+    while ($prow = $pending_payments->fetch_assoc()) {
+        $order_id = $prow['kode_pesanan'];
+        $api_url = $isProduction
+            ? "https://api.midtrans.com/v2/{$order_id}/status"
+            : "https://api.sandbox.midtrans.com/v2/{$order_id}/status";
+
+        $ch = curl_init($api_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Authorization: Basic ' . base64_encode($serverKey . ':')
+        ]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($response && $httpCode == 200) {
+            $api_result = json_decode($response, true);
+            $ts = $api_result['transaction_status'] ?? '';
+            $pt = $api_result['payment_type'] ?? '';
+            $fs = $api_result['fraud_status'] ?? '';
+            $ps = json_encode($api_result);
+
+            $up = $conn->prepare("UPDATE pembayaran SET status_transaksi = ?, jenis_pembayaran = ?, status_penipuan = ?, pesan_status = ?, dibayar_pada = CURRENT_TIMESTAMP WHERE id_pembayaran = ?");
+            $up->bind_param("ssssi", $ts, $pt, $fs, $ps, $prow['id_pembayaran']);
+            $up->execute();
+
+            if ($ts == 'capture' || $ts == 'settlement') {
+                $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Menunggu' WHERE id_reservasi = ?");
+                $ur->bind_param("i", $prow['id_reservasi']);
+                $ur->execute();
+            } elseif ($ts == 'cancel' || $ts == 'deny' || $ts == 'expire') {
+                $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Dibatalkan' WHERE id_reservasi = ?");
+                $ur->bind_param("i", $prow['id_reservasi']);
+                $ur->execute();
+            }
+        }
+    }
+}
+
+// Stats (include settlement/capture as lunas)
+$total_lunas    = $conn->query("SELECT COUNT(*) as c FROM pembayaran WHERE status_transaksi IN ('lunas','settlement','capture')")->fetch_assoc()['c'];
+$total_menunggu = $conn->query("SELECT COUNT(*) as c FROM pembayaran WHERE status_transaksi = 'pending'")->fetch_assoc()['c'];
+$total_pendapatan = $conn->query("SELECT SUM(jumlah_bayar) as total FROM pembayaran WHERE status_transaksi IN ('lunas','settlement','capture')")->fetch_assoc()['total'] ?? 0;
 
 // Get payments
 $sql = "SELECT pb.*, r.id_reservasi, r.nama_pemesan, k.nama_kamar
@@ -151,15 +213,25 @@ $payments = $conn->query($sql);
                     <tbody>
                         <?php if ($payments && $payments->num_rows > 0): while ($row = $payments->fetch_assoc()): 
                             $sts = $row['status_transaksi'];
-                            $bdg = $sts === 'lunas' ? 'badge-lunas' : ($sts === 'menunggu' ? 'badge-menunggu' : 'badge-gagal');
+                            $sts_label = $sts;
+                            if ($sts === 'settlement' || $sts === 'capture' || $sts === 'lunas') {
+                                $bdg = 'badge-lunas';
+                                $sts_label = 'Lunas';
+                            } elseif ($sts === 'pending' || $sts === 'menunggu') {
+                                $bdg = 'badge-menunggu';
+                                $sts_label = 'Menunggu';
+                            } else {
+                                $bdg = 'badge-gagal';
+                                $sts_label = ucfirst($sts);
+                            }
                         ?>
                         <tr>
                             <td><code class="text-primary"><?php echo htmlspecialchars($row['kode_pesanan']); ?></code></td>
                             <td><?php echo htmlspecialchars($row['nama_pemesan']); ?></td>
                             <td><?php echo htmlspecialchars($row['nama_kamar']); ?></td>
                             <td><strong>Rp <?php echo number_format($row['jumlah_bayar'], 0, ',', '.'); ?></strong></td>
-                            <td><?php echo htmlspecialchars($row['jenis_pembayaran'] ?? 'Tunai'); ?></td>
-                            <td><span class="<?php echo $bdg; ?>"><?php echo htmlspecialchars($sts); ?></span></td>
+                            <td><?php echo htmlspecialchars($row['jenis_pembayaran'] ?? '-'); ?></td>
+                            <td><span class="<?php echo $bdg; ?>"><?php echo htmlspecialchars($sts_label); ?></span></td>
                             <td><small class="text-muted"><?php echo $row['dibayar_pada'] ? date('d/m/Y', strtotime($row['dibayar_pada'])) : '-'; ?></small></td>
                             <td>
                                 <div class="dropdown">

@@ -20,6 +20,55 @@ if (isset($_GET['action']) && $_GET['action'] === 'delete' && isset($_GET['id'])
     header("Location: bookings.php?msg=deleted");
     exit();
 }
+
+// Auto-verify: cek pembayaran pending ke Midtrans API
+$pending_payments = $conn->query("SELECT p.id_pembayaran, p.kode_pesanan, p.id_reservasi FROM pembayaran p JOIN reservasi r ON p.id_reservasi = r.id_reservasi WHERE p.status_transaksi = 'pending' ORDER BY p.id_pembayaran DESC LIMIT 20");
+
+$serverKey = MIDTRANS_SERVER_KEY;
+$isProduction = MIDTRANS_IS_PRODUCTION;
+
+if ($pending_payments && $pending_payments->num_rows > 0) {
+    while ($prow = $pending_payments->fetch_assoc()) {
+        $order_id = $prow['kode_pesanan'];
+        $api_url = $isProduction
+            ? "https://api.midtrans.com/v2/{$order_id}/status"
+            : "https://api.sandbox.midtrans.com/v2/{$order_id}/status";
+
+        $ch = curl_init($api_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Authorization: Basic ' . base64_encode($serverKey . ':')
+        ]);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        if ($response && $httpCode == 200) {
+            $api_result = json_decode($response, true);
+            $ts = $api_result['transaction_status'] ?? '';
+            $pt = $api_result['payment_type'] ?? '';
+            $fs = $api_result['fraud_status'] ?? '';
+            $ps = json_encode($api_result);
+
+            $up = $conn->prepare("UPDATE pembayaran SET status_transaksi = ?, jenis_pembayaran = ?, status_penipuan = ?, pesan_status = ?, dibayar_pada = CURRENT_TIMESTAMP WHERE id_pembayaran = ?");
+            $up->bind_param("ssssi", $ts, $pt, $fs, $ps, $prow['id_pembayaran']);
+            $up->execute();
+
+            if ($ts == 'capture' || $ts == 'settlement') {
+                $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Menunggu' WHERE id_reservasi = ? AND status_reservasi = 'Menunggu Pembayaran'");
+                $ur->bind_param("i", $prow['id_reservasi']);
+                $ur->execute();
+            } elseif ($ts == 'cancel' || $ts == 'deny' || $ts == 'expire') {
+                $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Dibatalkan' WHERE id_reservasi = ? AND status_reservasi = 'Menunggu Pembayaran'");
+                $ur->bind_param("i", $prow['id_reservasi']);
+                $ur->execute();
+            }
+        }
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="id">

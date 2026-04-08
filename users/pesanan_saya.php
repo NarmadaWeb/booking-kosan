@@ -9,6 +9,62 @@ if (!isset($_SESSION['user_id'])) {
 
 // Filter by user id
 $user_id = $_SESSION['user_id'];
+
+// Auto-verify: cek status pembayaran yang masih pending ke Midtrans API
+$pending_sql = $conn->prepare("SELECT r.id_reservasi, p.kode_pesanan, p.id_pembayaran, p.status_transaksi 
+    FROM reservasi r 
+    JOIN pembayaran p ON r.id_reservasi = p.id_reservasi 
+    WHERE r.id_pengguna = ? AND r.status_reservasi = 'Menunggu Pembayaran' AND p.status_transaksi = 'pending'
+    ORDER BY p.id_pembayaran DESC");
+$pending_sql->bind_param("i", $user_id);
+$pending_sql->execute();
+$pending_result = $pending_sql->get_result();
+
+$serverKey = MIDTRANS_SERVER_KEY;
+$isProduction = MIDTRANS_IS_PRODUCTION;
+
+while ($prow = $pending_result->fetch_assoc()) {
+    $order_id = $prow['kode_pesanan'];
+    $api_url = $isProduction
+        ? "https://api.midtrans.com/v2/{$order_id}/status"
+        : "https://api.sandbox.midtrans.com/v2/{$order_id}/status";
+
+    $ch = curl_init($api_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Accept: application/json',
+        'Authorization: Basic ' . base64_encode($serverKey . ':')
+    ]);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+    if ($response && $httpCode == 200) {
+        $api_result = json_decode($response, true);
+        $ts = $api_result['transaction_status'] ?? '';
+        $pt = $api_result['payment_type'] ?? '';
+        $fs = $api_result['fraud_status'] ?? '';
+        $ps = json_encode($api_result);
+
+        // Update pembayaran
+        $up = $conn->prepare("UPDATE pembayaran SET status_transaksi = ?, jenis_pembayaran = ?, status_penipuan = ?, pesan_status = ?, dibayar_pada = CURRENT_TIMESTAMP WHERE id_pembayaran = ?");
+        $up->bind_param("ssssi", $ts, $pt, $fs, $ps, $prow['id_pembayaran']);
+        $up->execute();
+
+        // Update reservasi
+        if ($ts == 'capture' || $ts == 'settlement') {
+            $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Menunggu' WHERE id_reservasi = ?");
+            $ur->bind_param("i", $prow['id_reservasi']);
+            $ur->execute();
+        } elseif ($ts == 'cancel' || $ts == 'deny' || $ts == 'expire') {
+            $ur = $conn->prepare("UPDATE reservasi SET status_reservasi = 'Dibatalkan' WHERE id_reservasi = ?");
+            $ur->bind_param("i", $prow['id_reservasi']);
+            $ur->execute();
+        }
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="id">
@@ -38,25 +94,16 @@ $user_id = $_SESSION['user_id'];
         <?php if (isset($_GET['success'])): ?>
             <div class="alert alert-success"><?php echo htmlspecialchars($_GET['success']); ?></div>
         <?php endif; ?>
-        <?php if (isset($_GET['processing'])): ?>
-            <div class="alert alert-info shadow-sm rounded-4">
-                <div class="d-flex align-items-center">
-                    <div class="spinner-border spinner-border-sm text-info me-3" role="status"></div>
-                    <div>
-                        <strong>Pembayaran sedang diproses!</strong>
-                        <br><small>Kami sedang mengonfirmasi pembayaran Anda. Jika pesanan belum muncul, silakan muat ulang halaman ini dalam beberapa saat.</small>
-                    </div>
-                </div>
-            </div>
-        <?php endif; ?>
+
+
 
         <div class="row">
             <?php
-            $stmt = $conn->prepare("SELECT r.*, k.nama_kamar, k.harga_per_bulan, k.foto_utama, p.status_transaksi
+            $stmt = $conn->prepare("SELECT r.*, k.nama_kamar, k.harga_per_bulan, k.foto_utama, p.status_transaksi, p.token_snap
                                     FROM reservasi r 
                                     JOIN kamar k ON r.id_kamar = k.id_kamar 
                                     LEFT JOIN pembayaran p ON r.id_reservasi = p.id_reservasi
-                                    WHERE r.id_pengguna = ? AND r.status_reservasi != 'Menunggu Pembayaran'
+                                    WHERE r.id_pengguna = ?
                                     ORDER BY r.dibuat_pada DESC");
             $stmt->bind_param("i", $user_id);
             $stmt->execute();
@@ -89,6 +136,9 @@ $user_id = $_SESSION['user_id'];
                                     } elseif ($row['status_reservasi'] == 'Menunggu') {
                                         $badge = 'bg-warning text-dark';
                                         $status_text = 'Menunggu Konfirmasi Admin';
+                                    } elseif ($row['status_reservasi'] == 'Menunggu Pembayaran') {
+                                        $badge = 'bg-warning text-dark';
+                                        $status_text = 'Menunggu Pembayaran';
                                     } elseif ($row['status_reservasi'] == 'Selesai') {
                                         $badge = 'bg-info text-dark';
                                         $status_text = 'Selesai';
@@ -98,9 +148,10 @@ $user_id = $_SESSION['user_id'];
                                 </p>
                                 <p class="mb-0"><strong>Status Pembayaran:</strong>
                                     <?php
-                                    $pay_badge = 'bg-secondary';
+                                    $pay_badge = 'bg-danger';
                                     $pay_status_text = 'Belum Lunas';
                                     $pt = strtolower($row['status_transaksi'] ?? '');
+                                    $sr = $row['status_reservasi'] ?? '';
 
                                     if ($pt == 'settlement' || $pt == 'capture' || $pt == 'lunas') {
                                         $pay_badge = 'bg-success';
@@ -111,13 +162,25 @@ $user_id = $_SESSION['user_id'];
                                     } elseif ($pt == 'cancel' || $pt == 'deny' || $pt == 'expire') {
                                         $pay_badge = 'bg-danger';
                                         $pay_status_text = 'Gagal / Expired';
+                                    } elseif (empty($pt) && ($sr == 'Dikonfirmasi' || $sr == 'Selesai')) {
+                                        // Fallback: jika tidak ada record pembayaran tapi reservasi sudah dikonfirmasi
+                                        $pay_badge = 'bg-success';
+                                        $pay_status_text = 'Lunas';
+                                    } elseif (empty($pt) && $sr == 'Menunggu') {
+                                        $pay_badge = 'bg-success';
+                                        $pay_status_text = 'Lunas';
                                     }
                                     ?>
                                     <span class="badge <?php echo $pay_badge; ?>"><?php echo $pay_status_text; ?></span>
                                 </p>
                                 <div class="mt-3">
+                                    <?php if ($row['status_reservasi'] == 'Menunggu Pembayaran' && !empty($row['token_snap'])): ?>
+                                        <a href="bayar.php?id=<?php echo $row['id_reservasi']; ?>" class="btn btn-sm btn-danger rounded-pill px-3 me-1">
+                                            <i class="fas fa-credit-card me-1"></i> Bayar Sekarang
+                                        </a>
+                                    <?php endif; ?>
                                     <?php if ($row['status_reservasi'] == 'Dikonfirmasi'): ?>
-                                        <a href="cetak_kwitansi.php?id=<?php echo $row['id_reservasi']; ?>" target="_blank" class="btn btn-sm btn-success rounded-pill px-3">
+                                        <a href="cetak_kwitansi.php?id=<?php echo $row['id_reservasi']; ?>" target="_blank" class="btn btn-sm btn-success rounded-pill px-3 me-1">
                                             <i class="fas fa-print me-1"></i> Cetak Kwitansi
                                         </a>
                                     <?php endif; ?>
